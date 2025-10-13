@@ -1,0 +1,3 @@
+{"id": "file-1-001", "customer_id": "FILECUST-001", "amount": 42.5, "currency": "USD", "country": "US", "email": "file.user1@example.com", "status": "completed", "created_at": "2024-01-01T12:00:00Z", "source_system": "object_store"}
+{"id": "file-1-002", "customer_id": "FILECUST-002", "amount": 15.75, "currency": "EUR", "country": "DE", "email": "file.user2@example.com", "status": "pending", "created_at": "2024-01-02T12:00:00Z", "source_system": "object_store"}
+{"id": "file-1-003", "customer_id": "FILECUST-003", "amount": 88.0, "currency": "USD", "country": "US", "email": "file.user3@example.com", "status": "completed", "created_at": "2024-01-03T12:00:00Z", "source_system": "object_store"}
