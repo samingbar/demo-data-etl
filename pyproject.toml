@@ -1,0 +1,98 @@
+[project]
+name = "temporal-python-template"
+version = "0.1.0"
+description = "AI-enabled Temporal Python SDK project template"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "temporalio==1.18.1",
+    "aiohttp==3.13.0",
+    "pydantic==2.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "poethepoet==0.37.0",
+    "pre-commit==4.3.0",
+    "pytest==8.4.2",
+    "pytest-asyncio==1.2.0",
+    "pytest-cov==7.0.0",
+    "pytest-timeout==2.4.0",
+    "ruff==0.14.0",
+]
+
+[tool.poe.tasks.test]
+help = "Run the tests."
+cmd = "pytest -v"
+env = { PYTHONPATH = "." }
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --cov-report=term-missing --cov-report=xml --cov=src --cov-fail-under=80"
+python_files = ["*_tests.py"]
+# pytest-timeout configurations; https://pypi.org/project/pytest-timeout/
+timeout = 5  # 5 seconds timeout per test
+timeout_method = "thread"
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".idea",
+    ".mypy_cache",
+    ".tox",
+    ".venv"
+]
+target-version = "py312"
+line-length = 100
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "INP001", # require __init__,py
+    "D401", # first line should be in imperative mood
+    "A002", # re-define Python builtin
+    "D203", # 1 blank line required before class docstring
+    "D213", # 1 blank line required before function docstring
+    "COM812", # Checks for the absence of trailing commas
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"*_tests.py" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
+
+[tool.ruff.lint.isort]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.poe.tasks.lint]
+help = "Run the linter."
+cmd = "ruff check . --fix"
+
+[tool.poe.tasks.format]
+help = "Run the formatter."
+cmd = "ruff format ."
+
+[tool.poe.tasks.pre-commit-install]
+help = "Install pre-commit hooks."
+cmd = "pre-commit install --hook-type pre-commit --hook-type pre-push"
+
+[tool.poe.tasks.pre-commit-run]
+help = "Run pre-commit hooks on all files."
+cmd = "pre-commit run --all-files"
+
+[tool.poe.tasks.pre-commit-update]
+help = "Update pre-commit hook versions."
+cmd = "pre-commit autoupdate"
+
+[tool.bandit]
+exclude_dirs = ["tests", "*_tests.py"]
+skips = ["B101"]  # Skip assert_used test
