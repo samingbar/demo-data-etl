@@ -97,20 +97,109 @@ Demonstrate Temporal's strengths with a resilient extract→transform→load pip
 4. Resume with `make demo.resume` to continue ingestion.
 5. Inspect live state any time with `make demo.status`.
 
-### Live demo talk track (5–8 minutes)
+Tip: Temporal Web UI is available at `http://localhost:8233` when dev server is running. Open it to visualize the workflow, activity retries, and history. The demo intentionally sleeps briefly before fan-out to give you time to open the UI.
+
+### Flags and customization
+
+You can fully drive the demo via `scripts/demo.py` (the Makefile wraps these). Use `uv run python -m scripts.demo <subcommand> [flags]`.
+
+- `start` subcommand (launch stack and begin a run):
+  - `--source {http|object}`: choose source type (default `http`).
+  - `--api-port <int>`: mock HTTP API port (default `8081`).
+  - `--page-size <int>`: records per HTTP page (default `40`).
+  - `--max-pages <int>`: number of pages to ingest (default `5`).
+  - `--max-concurrency <int>`: concurrent batches (default `3`).
+  - `--interval <int>`: progress poll interval in seconds (default `10`).
+  - `--sink-path <path>`: SQLite sink path (default `data/warehouse/warehouse.db`).
+
+- Control subcommands (operate on the active run recorded under `.demo/state.json`):
+  - `pause`: send the pause signal (halts new batch fan-out; in-flight continues).
+  - `resume`: send the resume signal (continues fan-out).
+  - `status`: print the progress snapshot from the workflow query.
+  - `clean`: stop services and delete artifacts under `.demo/` and the default sink.
+
+- Mock API controls (HTTP source only):
+  - `mock offline [--duration <seconds>]`: simulate upstream outage; optional bounded duration.
+  - `mock online`: restore availability immediately.
+
+Examples:
+
+```bash
+# Minimal demo with defaults
+uv run python -m scripts.demo start
+
+# Larger pages, more fan-out, faster status polling
+uv run python -m scripts.demo start --page-size 80 --max-pages 8 --max-concurrency 5 --interval 5
+
+# Write sink to a custom location
+uv run python -m scripts.demo start --sink-path /tmp/warehouse.db
+
+# Object storage mode (reads local NDJSON under data/source_batches)
+uv run python -m scripts.demo start --source object
+
+# Simulate an outage for 30s, then restore
+uv run python -m scripts.demo mock offline --duration 30
+uv run python -m scripts.demo mock online
+```
+
+Make targets for convenience:
+
+- `make demo` → `start`
+- `make demo.pause` → `pause`
+- `make demo.resume` → `resume`
+- `make demo.status` → `status`
+- `make demo.clean` → `clean`
+- `make demo.mock-offline` → `mock offline`
+- `make demo.mock-online` → `mock online`
+
+### Framing the demo
+
+Audience: data/platform engineers and SREs evaluating reliability and control for ingestion pipelines.
+
+Key takeaways to state up front:
+- Temporal makes ETL progress durable across process crashes and redeploys.
+- Retries/backoff are declared once and handled uniformly across activities.
+- Operators have a safe control surface (signals, queries) to manage backpressure.
+- Sources and sinks remain customer-owned; Temporal orchestrates, doesn’t store your data.
+
+Environment prep (before you start talking):
+- Close stray Temporal dev servers; run `make demo.clean` if you’ve demoed recently.
+- Ensure ports are free: `7233` (Temporal), `8233` (Temporal UI), `8081` (mock API) or adjust flags.
+- Have `http://localhost:8233` ready in a browser tab.
+- Optionally remove `data/warehouse/warehouse.db` if you want a fresh sink.
+
+### Live demo run-of-show (5–8 minutes)
 
 1. **Kickoff (0:00–1:00):** Run `make demo`, call out customer-owned API/object storage + warehouse, and show the ASCII architecture.
 2. **Reliability (1:00–2:30):** Point to logs showing automatic retries/backoff when the mock API throws 429/503 or timeouts; highlight that Temporal replays deterministically.
 3. **Control surface (2:30–4:00):** Send `make demo.pause`; explain signals pause new batch fan-out while heartbeats keep in-flight loads resumable. Resume and show workflow picks up instantly.
-4. **Observability (4:00–5:30):** Run `make demo.status`; share progress metrics (batches/items/retries/last error). Mention queries work even mid-flight.
-5. **Safety nets (5:30–7:00):** Restart the worker (Ctrl+C + rerun `make demo` if desired) to illustrate heartbeats/idempotent sink preventing duplicates. Emphasize customer infra stays untouched.
-6. **Wrap (7:00–8:00):** Summarize benefits: zero lost work, automatic recoveries, customer resource ownership, and precise operational control.
+4. **Observability (4:00–5:30):** Run `make demo.status`; share progress metrics (batches/items/retries/last_error). Open Temporal UI to show workflow history, retries, and signals.
+5. **Safety nets (5:30–7:00):** Kill the worker process (Ctrl+C in the worker pane) and relaunch the demo worker (re-run `make demo` or `uv run -m scripts.demo start` if needed). Show it resumes exactly where it left off because of activity heartbeats and idempotent sink writes.
+6. **Optional outage (7:00–7:30):** `make demo.mock-offline` (or `uv run python -m scripts.demo mock offline --duration 20`) to simulate upstream downtime. Note backoff, retries, and no manual glue code.
+7. **Wrap (7:30–8:00):** Summarize: zero lost work, automatic recovery, customer resource ownership, and precise operator controls.
 
 ### Triggering failure modes
 
 - The mock API intentionally injects 429/503 responses and an occasional forced timeout per page.
 - The load activity heartbeats each record; kill the worker and restart to prove checkpointed resume.
 - Run with `make demo.pause` during high retry counts to show backpressure controls.
+ - Force an upstream outage with `make demo.mock-offline` (restore with `make demo.mock-online`). Use `--duration` via the CLI if you want a bounded outage.
+
+### Object storage mode
+
+- Instead of HTTP, ingest from local NDJSON batches under `data/source_batches`.
+- Start with `uv run python -m scripts.demo start --source object`.
+- Customize file enumeration by changing `file_glob`/`root_path` in `src/workflows/etl/models.py` or by adding files under `data/source_batches/`.
+
+### Inspecting results
+
+- The default sink is a SQLite database at `data/warehouse/warehouse.db`.
+- If you have `sqlite3` installed, you can quickly inspect counts:
+
+```bash
+sqlite3 data/warehouse/warehouse.db \
+  "SELECT COUNT(1) AS rows, SUM(status='completed') AS completed FROM etl_records;"
+```
 
 ### Cleanup
 

@@ -1,10 +1,10 @@
 {
-  "workflow_id": "etl-demo-1760635486",
+  "workflow_id": "etl-demo-1760641369",
   "run_id": null,
   "task_queue": "etl-task-queue",
-  "source_type": "http_api",
-  "temporal_pid": 97405,
-  "created_at": 1760635487.939378,
-  "api_host": "127.0.0.1",
-  "api_port": 8081
+  "source_type": "object_storage",
+  "temporal_pid": 12450,
+  "created_at": 1760641370.157134,
+  "api_host": null,
+  "api_port": null
 }

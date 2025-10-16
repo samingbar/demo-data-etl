@@ -336,7 +336,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     start_parser.add_argument("--page-size", type=int, default=40)
     start_parser.add_argument("--max-pages", type=int, default=5)
     start_parser.add_argument("--max-concurrency", type=int, default=3)
-    start_parser.add_argument("--interval", type=int, default=3, help="Progress poll interval (seconds)")
+    start_parser.add_argument("--interval", type=int, default=10, help="Progress poll interval (seconds)")
     start_parser.add_argument(
         "--sink-path",
         default="data/warehouse/warehouse.db",
