@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -31,13 +32,22 @@ class MockApiServer:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._gates: Dict[str, datetime] = {}
+        self._offline_active: bool = False
+        self._offline_until: Optional[datetime] = None
         self._datasets: Dict[str, List[dict]] = {}
         self._seed_dataset("transactions")
 
     async def start(self) -> None:
         """Start the aiohttp web server."""
         app = web.Application()
-        app.add_routes([web.get("/datasets/{dataset}", self._handle_dataset)])
+        app.add_routes(
+            [
+                web.get("/datasets/{dataset}", self._handle_dataset),
+                web.post("/_admin/mock/offline", self._handle_offline),
+                web.post("/_admin/mock/online", self._handle_online),
+                web.get("/_admin/mock/status", self._handle_status),
+            ]
+        )
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         self._site = web.TCPSite(
@@ -66,6 +76,16 @@ class MockApiServer:
         key = f"{dataset}:{page}"
         gate_until = self._gates.get(dataset)
         now = datetime.now(tz=timezone.utc)
+        if self._offline_active:
+            if self._offline_until and now >= self._offline_until:
+                self._offline_active = False
+                self._offline_until = None
+            else:
+                body: Dict[str, object] = {"detail": "mock api offline"}
+                if self._offline_until:
+                    retry_after = int((self._offline_until - now).total_seconds())
+                    body["retry_after"] = retry_after if retry_after > 0 else 1
+                return web.json_response(body, status=503)
         if gate_until and now < gate_until:
             return web.json_response(
                 {"detail": "rate limit window active", "retry_after": 2},
@@ -143,6 +163,52 @@ class MockApiServer:
             }
             rows.append(record)
         self._datasets[name] = rows
+
+    async def _handle_offline(self, request: web.Request) -> web.Response:
+        """Temporarily gate the mock API to simulate an outage."""
+        payload: Dict[str, int] = {}
+        if request.can_read_body:
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError:
+                payload = {}
+        duration_seconds = payload.get("duration_seconds")
+        now = datetime.now(tz=timezone.utc)
+        self._offline_active = True
+        if duration_seconds is not None and duration_seconds > 0:
+            self._offline_until = now + timedelta(seconds=int(duration_seconds))
+        else:
+            self._offline_until = None
+        return web.json_response(
+            {
+                "status": "offline",
+                "duration_seconds": duration_seconds if duration_seconds and duration_seconds > 0 else None,
+                "until": self._offline_until.isoformat() if self._offline_until else None,
+            }
+        )
+
+    async def _handle_online(self, request: web.Request) -> web.Response:
+        """Restore the mock API after an outage."""
+        self._offline_active = False
+        self._offline_until = None
+        return web.json_response({"status": "online"})
+
+    async def _handle_status(self, request: web.Request) -> web.Response:
+        """Return the current mock API availability status."""
+        now = datetime.now(tz=timezone.utc)
+        retry_after = None
+        if self._offline_active:
+            if self._offline_until and now >= self._offline_until:
+                self._offline_active = False
+                self._offline_until = None
+            elif self._offline_until:
+                retry_after = int((self._offline_until - now).total_seconds())
+        return web.json_response(
+            {
+                "status": "offline" if self._offline_active else "online",
+                "retry_after": retry_after,
+            }
+        )
 
 
 async def run_forever(config: MockApiConfig | None = None) -> None:  # pragma: no cover

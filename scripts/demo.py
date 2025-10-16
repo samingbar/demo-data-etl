@@ -13,8 +13,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
-from pydantic import BaseModel
 from datetime import datetime
+from aiohttp import ClientError, ClientSession
+from pydantic import BaseModel
 
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -29,7 +30,7 @@ from src.workflows.etl.activities import (
 )
 from src.workflows.etl.etl_workflow import DurableEtlWorkflow
 from src.workflows.etl.mock_api import MockApiConfig, MockApiServer
-from workflows.etl.models import (
+from src.workflows.etl.models import (
     EtlWorkflowInput,
     HttpSourceConfig,
     ObjectStorageSourceConfig,
@@ -52,6 +53,8 @@ class DemoState:
     source_type: str
     temporal_pid: Optional[int]
     created_at: float
+    api_host: Optional[str] = None
+    api_port: Optional[int] = None
 
     def to_json(self) -> Dict[str, Any]:
         return self.__dict__
@@ -118,6 +121,7 @@ async def start_demo(args: argparse.Namespace) -> None:
     workflow_id = f"etl-demo-{int(time.time())}"
     mock_api: Optional[MockApiServer] = None
     client: Optional[Client] = None
+    demo_started = False
     try:
         await wait_for_server()
         api_config = MockApiConfig(port=args.api_port)
@@ -178,21 +182,29 @@ async def start_demo(args: argparse.Namespace) -> None:
                     source_type=workflow_input.source_type.value,
                     temporal_pid=temporal_proc.pid if temporal_proc.pid else None,
                     created_at=time.time(),
+                    api_host=api_config.host if args.source == "http" else None,
+                    api_port=actual_port if args.source == "http" else None,
                 )
             )
             print(f"Started workflow {workflow_id} (run_id={handle.run_id})")
             await monitor_progress(handle, args.interval)
+            print("Temporal dev server is still running; use `make demo.clean` when you're ready to tear it down.")
+            demo_started = True
     finally:
-        clear_state()
         if mock_api is not None:
             await mock_api.stop()
-        if temporal_proc.returncode is None:
-            temporal_proc.send_signal(signal.SIGTERM)
-            try:
-                await asyncio.wait_for(temporal_proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                temporal_proc.kill()
-        await asyncio.sleep(0.1)
+        if not demo_started:
+            if temporal_proc.returncode is None:
+                temporal_proc.send_signal(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(temporal_proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    temporal_proc.kill()
+            clear_state()
+        else:
+            # If the Temporal process exited unexpectedly, remove state so clean doesn't fail later.
+            if temporal_proc.returncode is not None:
+                clear_state()
 
 
 async def monitor_progress(handle, interval: int) -> None:
@@ -259,6 +271,44 @@ async def query_status() -> None:
     print(json.dumps(snapshot.model_dump(mode='json'), indent=2))
 
 
+async def control_mock_api(online: bool, duration: Optional[int] = None) -> None:
+    """Toggle the mock API server to simulate outages."""
+    state = load_state()
+    if state is None:
+        raise RuntimeError("No active demo run found.")
+    if state.source_type != SourceType.HTTP_API.value:
+        raise RuntimeError("Mock API controls are only available for HTTP source demo runs.")
+    if state.api_host is None or state.api_port is None:
+        raise RuntimeError("Mock API connection details missing; restart the demo.")
+    if not online and duration is not None and duration < 0:
+        raise ValueError("duration must be non-negative")
+    payload: Dict[str, Any] = {}
+    if not online and duration:
+        payload["duration_seconds"] = duration
+    url_suffix = "online" if online else "offline"
+    base_url = f"http://{state.api_host}:{state.api_port}"
+    try:
+        async with ClientSession() as session:
+            async with session.post(f"{base_url}/_admin/mock/{url_suffix}", json=payload) as response:
+                if response.status >= 400:
+                    details = await response.text()
+                    raise RuntimeError(
+                        f"Mock API {url_suffix} request failed with HTTP {response.status}: {details}"
+                    )
+                data = await response.json()
+    except ClientError as exc:
+        raise RuntimeError(f"Failed to reach mock API control endpoint: {exc}") from exc
+
+    if online:
+        print("Mock API availability restored.")
+    else:
+        duration_info = data.get("duration_seconds")
+        if duration_info:
+            print(f"Mock API taken offline for {duration_info} seconds.")
+        else:
+            print("Mock API taken offline until restored with `mock online`.")
+
+
 def clean_artifacts() -> None:
     """Remove generated artifacts and kill lingering Temporal dev servers."""
     state = load_state()
@@ -297,6 +347,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     subparsers.add_parser("resume", help="Send resume signal to the workflow")
     subparsers.add_parser("status", help="Print workflow progress snapshot")
     subparsers.add_parser("clean", help="Stop services and remove artifacts")
+    mock_parser = subparsers.add_parser("mock", help="Control the mock API availability")
+    mock_subparsers = mock_parser.add_subparsers(dest="mock_command", required=True)
+    mock_offline = mock_subparsers.add_parser("offline", help="Simulate a mock API outage")
+    mock_offline.add_argument(
+        "--duration",
+        type=int,
+        default=None,
+        help="Optional outage duration in seconds (omit for manual restore).",
+    )
+    mock_subparsers.add_parser("online", help="Restore the mock API after an outage")
 
     return parser.parse_args(argv)
 
@@ -313,6 +373,13 @@ async def main(argv: list[str]) -> None:
         await query_status()
     elif args.command == "clean":
         clean_artifacts()
+    elif args.command == "mock":
+        if args.mock_command == "offline":
+            await control_mock_api(False, args.duration)
+        elif args.mock_command == "online":
+            await control_mock_api(True)
+        else:  # pragma: no cover - defensive
+            raise RuntimeError(f"Unsupported mock API command {args.mock_command}")
     else:  # pragma: no cover - defensive
         raise RuntimeError(f"Unsupported command {args.command}")
 

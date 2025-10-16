@@ -69,7 +69,7 @@ class DurableEtlWorkflow:
     @workflow.run
     async def run(self, input_data: EtlWorkflowInput) -> ProgressSnapshot:
         
-        await asyncio.sleep(45) # Insert a wait time to launch the UI
+        await asyncio.sleep(30) # Insert a wait time to launch the UI
         
         workflow.logger.info(
             "Starting ETL workflow run_id=%s source=%s",
@@ -126,7 +126,7 @@ class DurableEtlWorkflow:
         )
         self._update_progress()
         return self._progress
-    
+    #Pause the process mid-stream
     @workflow.signal
     async def pause(self) -> None:
         """Pause processing of new batches (in-flight work continues)."""
@@ -135,7 +135,7 @@ class DurableEtlWorkflow:
         self._paused = True
         # Signals let operators apply backpressure without losing deterministic state
         self._update_progress()
-
+    #Resume the process if paused
     @workflow.signal
     async def resume(self) -> None:
         """Resume processing after a pause."""
