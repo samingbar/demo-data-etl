@@ -111,6 +111,7 @@ You can fully drive the demo via `scripts/demo.py` (the Makefile wraps these). U
   - `--max-concurrency <int>`: concurrent batches (default `3`).
   - `--interval <int>`: progress poll interval in seconds (default `10`).
   - `--sink-path <path>`: SQLite sink path (default `data/warehouse/warehouse.db`).
+  - `--enable-failures` / `--disable-failures`: toggle simulated API faults (timeouts/429/503). If not provided, the first run defaults to disabled; subsequent runs default to enabled.
 
 - Control subcommands (operate on the active run recorded under `.demo/state.json`):
   - `pause`: send the pause signal (halts new batch fan-out; in-flight continues).
@@ -180,7 +181,7 @@ Environment prep (before you start talking):
 
 ### Triggering failure modes
 
-- The mock API intentionally injects 429/503 responses and an occasional forced timeout per page.
+- The mock API can inject 429/503 responses and an occasional forced timeout per page. By default, these are disabled on the very first run to ease setup, and enabled on subsequent runs. Override anytime with `--enable-failures` or `--disable-failures` on `start`.
 - The load activity heartbeats each record; kill the worker and restart to prove checkpointed resume.
 - Run with `make demo.pause` during high retry counts to show backpressure controls.
  - Force an upstream outage with `make demo.mock-offline` (restore with `make demo.mock-online`). Use `--duration` via the CLI if you want a bounded outage.

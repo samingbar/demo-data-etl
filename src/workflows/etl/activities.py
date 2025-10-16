@@ -102,7 +102,7 @@ async def enumerate_batches(input_data: EnumerateBatchesInput) -> List[SourceBat
         len(batches),
         source_dir,
     )
-    await asyncio.sleep(random.randint(1,30)) # Inject a pause into the execution for demo purposes 
+    await asyncio.sleep(random.randint(1,15)) # Inject a pause into the execution for demo purposes 
 
     return batches
 
@@ -167,7 +167,7 @@ async def fetch_http_batch(request: HttpBatchRequest) -> ExtractBatchResult:
         )
         for item in items
     ]
-    await asyncio.sleep(random.randint(1,30)) # Inject a pause into the execution for demo purposes 
+    await asyncio.sleep(random.randint(1,15)) # Inject a pause into the execution for demo purposes 
 
     activity.logger.info(
         "Fetched %s records from HTTP batch %s",
@@ -208,7 +208,7 @@ async def fetch_object_batch(request: ObjectBatchRequest) -> ExtractBatchResult:
                     payload={**payload, "batch_id": batch.batch_id},
                 )
             )
-    await asyncio.sleep(random.randint(0,35)) # Inject a pause into the execution for demo purposes 
+    await asyncio.sleep(random.randint(0,17)) # Inject a pause into the execution for demo purposes 
     activity.logger.info(
         "Read %s records from file batch %s",
         len(extracted),
@@ -231,7 +231,7 @@ async def transform_batch(request: TransformBatchRequest) -> TransformBatchResul
         request.batch.batch_id,
     )
     
-    await asyncio.sleep(random.randint(0,25)) # Inject a pause into the execution for demo purposes 
+    await asyncio.sleep(random.randint(0,12)) # Inject a pause into the execution for demo purposes 
 
     return TransformBatchResult(
         batch=request.batch,
@@ -310,7 +310,7 @@ async def load_batch(request: LoadBatchRequest) -> LoadBatchResult:
         request.batch.batch_id,
     )
 
-    await asyncio.sleep(random.randint(1,30)) # Inject a pause into the execution for demo purposes 
+    await asyncio.sleep(random.randint(1,15)) # Inject a pause into the execution for demo purposes 
 
     return LoadBatchResult(
         inserted_count=inserted,

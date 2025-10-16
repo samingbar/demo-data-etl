@@ -6,20 +6,21 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import shutil
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime
+import aiohttp
 from aiohttp import ClientError, ClientSession
-from pydantic import BaseModel
 
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.worker import Worker
+ 
 
 from src.workflows.etl.activities import (
     enumerate_batches,
@@ -41,38 +42,87 @@ from src.workflows.etl.worker import DEFAULT_TASK_QUEUE
 
 STATE_DIR = Path(".demo")
 STATE_FILE = STATE_DIR / "state.json"
+FIRST_RUN_SENTINEL = STATE_DIR / "first_run_done"
 
 
 @dataclass
 class DemoState:
-    """Persisted metadata about an in-flight demo run."""
+    """Metadata about a single in-flight demo workflow run."""
 
     workflow_id: str
     run_id: Optional[str]
     task_queue: str
     source_type: str
-    temporal_pid: Optional[int]
     created_at: float
-    api_host: Optional[str] = None
-    api_port: Optional[int] = None
 
     def to_json(self) -> Dict[str, Any]:
         return self.__dict__
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "DemoState":
-        return cls(**data)
+        return cls(
+            workflow_id=data.get("workflow_id"),
+            run_id=data.get("run_id"),
+            task_queue=data.get("task_queue"),
+            source_type=data.get("source_type"),
+            created_at=data.get("created_at", time.time()),
+        )
 
 
-def load_state() -> Optional[DemoState]:
+@dataclass
+class DemoIndex:
+    """Global index of demo state allowing multiple concurrent runs."""
+
+    # Shared services
+    temporal_pid: Optional[int] = None
+    api_host: Optional[str] = None
+    api_port: Optional[int] = None
+    created_at: float = field(default_factory=time.time)
+    # Map workflow_id -> DemoState
+    runs: Dict[str, DemoState] = field(default_factory=dict)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "temporal_pid": self.temporal_pid,
+            "api_host": self.api_host,
+            "api_port": self.api_port,
+            "created_at": self.created_at,
+            "runs": {k: v.to_json() for k, v in self.runs.items()},
+        }
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> "DemoIndex":
+        # Back-compat: if a single-run shape is detected, wrap it in the index
+        if "runs" not in data:
+            # Assume legacy DemoState schema
+            legacy = DemoState.from_json(data)
+            idx = cls(
+                temporal_pid=data.get("temporal_pid"),
+                api_host=data.get("api_host"),
+                api_port=data.get("api_port"),
+                created_at=data.get("created_at", time.time()),
+                runs={legacy.workflow_id: legacy},
+            )
+            return idx
+        runs = {k: DemoState.from_json(v) for k, v in data.get("runs", {}).items()}
+        return cls(
+            temporal_pid=data.get("temporal_pid"),
+            api_host=data.get("api_host"),
+            api_port=data.get("api_port"),
+            created_at=data.get("created_at", time.time()),
+            runs=runs,
+        )
+
+
+def load_index() -> Optional[DemoIndex]:
     if not STATE_FILE.exists():
         return None
-    return DemoState.from_json(json.loads(STATE_FILE.read_text()))
+    return DemoIndex.from_json(json.loads(STATE_FILE.read_text()))
 
 
-def save_state(state: DemoState) -> None:
+def save_index(index: DemoIndex) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state.to_json(), indent=2))
+    STATE_FILE.write_text(json.dumps(index.to_json(), indent=2))
 
 
 def clear_state() -> None:
@@ -113,21 +163,61 @@ async def wait_for_server(host: str = "localhost:7233", retries: int = 30) -> No
 
 async def start_demo(args: argparse.Namespace) -> None:
     """Start the end-to-end demo run."""
-    if load_state() is not None:
-        raise RuntimeError("An existing demo run is in progress; run `make demo.clean` first.")
+    # Allow multiple concurrent runs; reuse shared services if present.
+    index = load_index()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_dir = STATE_DIR / "logs"
-    temporal_proc = await launch_temporal_server(log_dir)
+    temporal_proc: Optional[asyncio.subprocess.Process] = None
+    # Launch Temporal dev server only if this is the first run
+    if index is None or index.temporal_pid is None:
+        temporal_proc = await launch_temporal_server(log_dir)
     workflow_id = f"etl-demo-{int(time.time())}"
     mock_api: Optional[MockApiServer] = None
     client: Optional[Client] = None
     demo_started = False
     try:
         await wait_for_server()
-        api_config = MockApiConfig(port=args.api_port)
+        # Determine whether to inject failures in the mock API.
+        # Default behavior: disable on the very first run, enable otherwise.
+        if args.inject_failures is None:
+            default_inject = FIRST_RUN_SENTINEL.exists()
+        else:
+            default_inject = bool(args.inject_failures)
+
+        api_config = MockApiConfig(port=args.api_port, inject_failures=default_inject)
+
+        async def _api_is_running(host: str, port: int) -> bool:
+            url = f"http://{host}:{port}/_admin/mock/status"
+            try:
+                timeout = aiohttp.ClientTimeout(total=2)
+                async with ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        return resp.status == 200
+            except Exception:
+                return False
+
         if args.source == "http":
-            mock_api = MockApiServer(api_config)
-            await mock_api.start()
+            # If an API location is recorded, verify it is actually reachable; otherwise launch it.
+            if index is not None and index.api_host is not None and index.api_port is not None:
+                # Enforce stable API host/port across concurrent runs
+                if index.api_host != api_config.host or index.api_port != api_config.port:
+                    raise RuntimeError(
+                        f"Mock API already running at {index.api_host}:{index.api_port}; cannot start with different host/port {api_config.host}:{api_config.port}."
+                    )
+                if await _api_is_running(index.api_host, index.api_port):
+                    mock_api = None  # Reuse existing
+                else:
+                    # Recorded endpoint is down; start a new one at the same host/port
+                    resurrect_cfg = MockApiConfig(
+                        host=index.api_host,
+                        port=index.api_port,
+                        inject_failures=default_inject,
+                    )
+                    mock_api = MockApiServer(resurrect_cfg)
+                    await mock_api.start()
+            else:
+                mock_api = MockApiServer(api_config)
+                await mock_api.start()
         client = await Client.connect(
             "localhost:7233",
             namespace="default",
@@ -154,47 +244,49 @@ async def start_demo(args: argparse.Namespace) -> None:
             max_concurrent_batches=args.max_concurrency,
         )
 
-        activities = [
-            enumerate_batches,
-            fetch_http_batch,
-            fetch_object_batch,
-            transform_batch,
-            load_batch,
-        ]
+        # Ensure workflow_id uniqueness if a custom scheme is introduced in future
+        if index and workflow_id in index.runs:
+            raise RuntimeError(f"A workflow with id {workflow_id} already exists.")
 
-        async with Worker(
-            client,
+        handle = await client.start_workflow(
+            DurableEtlWorkflow.run,
+            workflow_input,
+            id=workflow_id,
             task_queue=DEFAULT_TASK_QUEUE,
-            workflows=[DurableEtlWorkflow],
-            activities=activities,
-        ):
-            handle = await client.start_workflow(
-                DurableEtlWorkflow.run,
-                workflow_input,
-                id=workflow_id,
-                task_queue=DEFAULT_TASK_QUEUE,
-            )
-            save_state(
-                DemoState(
-                    workflow_id=workflow_id,
-                    run_id=handle.run_id,
-                    task_queue=DEFAULT_TASK_QUEUE,
-                    source_type=workflow_input.source_type.value,
-                    temporal_pid=temporal_proc.pid if temporal_proc.pid else None,
-                    created_at=time.time(),
-                    api_host=api_config.host if args.source == "http" else None,
-                    api_port=actual_port if args.source == "http" else None,
-                )
-            )
-            print(f"Started workflow {workflow_id} (run_id={handle.run_id})")
-            await monitor_progress(handle, args.interval)
-            print("Temporal dev server is still running; use `make demo.clean` when you're ready to tear it down.")
-            demo_started = True
+        )
+        # Update and persist the index
+        if index is None:
+            index = DemoIndex()
+        # Set shared services details if not already set
+        if index.temporal_pid is None and temporal_proc and temporal_proc.pid:
+            index.temporal_pid = temporal_proc.pid
+        if args.source == "http" and (index.api_host is None or index.api_port is None):
+            index.api_host = api_config.host
+            index.api_port = actual_port
+        # Add this run
+        index.runs[workflow_id] = DemoState(
+            workflow_id=workflow_id,
+            run_id=handle.run_id,
+            task_queue=DEFAULT_TASK_QUEUE,
+            source_type=workflow_input.source_type.value,
+            created_at=time.time(),
+        )
+        save_index(index)
+        # Mark that a first run has occurred so subsequent runs default to enabled faults.
+        try:
+            FIRST_RUN_SENTINEL.touch(exist_ok=True)
+        except Exception:
+            pass  # Non-fatal if we cannot write the sentinel
+        print(f"Started workflow {workflow_id} (run_id={handle.run_id})")
+        print("Note: Worker is not auto-started. Run `make worker` in another terminal.")
+        await monitor_progress(handle, args.interval)
+        print("Temporal dev server is still running; use `make demo.clean` when you're ready to tear it down.")
+        demo_started = True
     finally:
         if mock_api is not None:
             await mock_api.stop()
         if not demo_started:
-            if temporal_proc.returncode is None:
+            if temporal_proc is not None and temporal_proc.returncode is None:
                 temporal_proc.send_signal(signal.SIGTERM)
                 try:
                     await asyncio.wait_for(temporal_proc.wait(), timeout=5)
@@ -203,7 +295,7 @@ async def start_demo(args: argparse.Namespace) -> None:
             clear_state()
         else:
             # If the Temporal process exited unexpectedly, remove state so clean doesn't fail later.
-            if temporal_proc.returncode is not None:
+            if temporal_proc is not None and temporal_proc.returncode is not None:
                 clear_state()
 
 
@@ -235,17 +327,30 @@ async def monitor_progress(handle, interval: int) -> None:
         raise
 
 
-async def send_signal(signal_name: str) -> None:
-    """Send a pause/resume signal to the active workflow."""
-    state = load_state()
-    if state is None:
-        raise RuntimeError("No active demo run found.")
+def _select_workflow_id(index: DemoIndex, workflow_id: Optional[str]) -> str:
+    if workflow_id:
+        if workflow_id not in index.runs:
+            raise RuntimeError(f"Workflow id {workflow_id} not found in state.")
+        return workflow_id
+    if not index.runs:
+        raise RuntimeError("No active demo runs found.")
+    if len(index.runs) == 1:
+        return next(iter(index.runs.keys()))
+    raise RuntimeError("Multiple runs found; specify --workflow-id to disambiguate.")
+
+
+async def send_signal(signal_name: str, workflow_id: Optional[str]) -> None:
+    """Send a pause/resume signal to a chosen workflow."""
+    index = load_index()
+    if index is None:
+        raise RuntimeError("No active demo runs found.")
+    target_wid = _select_workflow_id(index, workflow_id)
     client = await Client.connect(
         "localhost:7233",
         namespace="default",
         data_converter=pydantic_data_converter,
     )
-    handle = client.get_workflow_handle(state.workflow_id)
+    handle = client.get_workflow_handle(target_wid)
     if signal_name == "pause":
         await handle.signal(DurableEtlWorkflow.pause)
         print("Pause signal sent.")
@@ -256,37 +361,37 @@ async def send_signal(signal_name: str) -> None:
         raise ValueError(f"Unknown signal {signal_name}")
 
 
-async def query_status() -> None:
-    """Query the active workflow for current progress."""
-    state = load_state()
-    if state is None:
-        raise RuntimeError("No active demo run found.")
+async def query_status(workflow_id: Optional[str]) -> None:
+    """Query a workflow for current progress."""
+    index = load_index()
+    if index is None:
+        raise RuntimeError("No active demo runs found.")
+    target_wid = _select_workflow_id(index, workflow_id)
     client = await Client.connect(
         "localhost:7233",
         namespace="default",
         data_converter=pydantic_data_converter,
     )
-    handle = client.get_workflow_handle(state.workflow_id)
+    handle = client.get_workflow_handle(target_wid)
     snapshot = await handle.query(DurableEtlWorkflow.progress)
     print(json.dumps(snapshot.model_dump(mode='json'), indent=2))
 
 
 async def control_mock_api(online: bool, duration: Optional[int] = None) -> None:
     """Toggle the mock API server to simulate outages."""
-    state = load_state()
-    if state is None:
-        raise RuntimeError("No active demo run found.")
-    if state.source_type != SourceType.HTTP_API.value:
+    index = load_index()
+    if index is None:
+        raise RuntimeError("No active demo runs found.")
+    # Mock API controls only make sense if HTTP demo server is managed
+    if index.api_host is None or index.api_port is None:
         raise RuntimeError("Mock API controls are only available for HTTP source demo runs.")
-    if state.api_host is None or state.api_port is None:
-        raise RuntimeError("Mock API connection details missing; restart the demo.")
     if not online and duration is not None and duration < 0:
         raise ValueError("duration must be non-negative")
     payload: Dict[str, Any] = {}
     if not online and duration:
         payload["duration_seconds"] = duration
     url_suffix = "online" if online else "offline"
-    base_url = f"http://{state.api_host}:{state.api_port}"
+    base_url = f"http://{index.api_host}:{index.api_port}"
     try:
         async with ClientSession() as session:
             async with session.post(f"{base_url}/_admin/mock/{url_suffix}", json=payload) as response:
@@ -311,12 +416,81 @@ async def control_mock_api(online: bool, duration: Optional[int] = None) -> None
 
 def clean_artifacts() -> None:
     """Remove generated artifacts and kill lingering Temporal dev servers."""
-    state = load_state()
-    if state and state.temporal_pid:
+    index = load_index()
+
+    # Helper: collect PIDs bound to TCP ports via lsof (best effort, POSIX only)
+    def pids_on_ports(ports: list[int]) -> set[int]:
+        pids: set[int] = set()
+        if shutil.which("lsof") is None:
+            return pids
+        for port in ports:
+            try:
+                out = subprocess.check_output(["lsof", "-ti", f"tcp:{port}"] , text=True)
+                for line in out.strip().splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        pids.add(int(line))
+            except subprocess.CalledProcessError:
+                # No processes on this port
+                continue
+            except Exception:
+                # Any other failure: ignore and continue best-effort
+                continue
+        return pids
+
+    # Helper: best-effort pattern kill (Temporal CLI dev server)
+    def try_pkill(pattern: str) -> None:
+        cmd = shutil.which("pkill")
+        if not cmd:
+            return
         try:
-            os.kill(state.temporal_pid, signal.SIGTERM)
+            subprocess.run([cmd, "-f", pattern], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    # Attempt to gracefully stop any tracked Temporal dev server
+    if index and index.temporal_pid:
+        try:
+            os.kill(index.temporal_pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+    # Aggressively clean up any stray Temporal dev servers and mock API servers
+    # - Temporal dev server commonly uses 7233 (frontend) and 8233 (UI)
+    # - Mock API defaults to 8081, but prefer the recorded port if present
+    api_port = index.api_port if index and index.api_port else 8081
+    candidate_ports = {7233, 8233, int(api_port)}
+    pids = pids_on_ports(sorted(candidate_ports))
+
+    # Also try name-based kill for Temporal CLI dev servers
+    try_pkill("temporal server start-dev")
+
+    # Send TERM to any discovered PIDs, then KILL if they linger
+    for pid in list(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pids.discard(pid)
+        except Exception:
+            # Ignore and continue
+            pass
+
+    # Small grace period
+    try:
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    # Recompute and force kill remaining if needed
+    remaining = pids_on_ports(sorted(candidate_ports))
+    for pid in list(remaining):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+
     clear_state()
     if STATE_DIR.exists():
         shutil.rmtree(STATE_DIR)
@@ -342,10 +516,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="data/warehouse/warehouse.db",
         help="Location for the SQLite sink owned by the customer.",
     )
+    # Failure injection control for the mock API: if neither is provided,
+    # first run defaults to disabled, subsequent runs default to enabled.
+    group = start_parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--enable-failures",
+        dest="inject_failures",
+        action="store_true",
+        help="Enable simulated API failures (timeouts/429/503).",
+    )
+    group.add_argument(
+        "--disable-failures",
+        dest="inject_failures",
+        action="store_false",
+        help="Disable simulated API failures.",
+    )
+    start_parser.set_defaults(inject_failures=None)
 
-    subparsers.add_parser("pause", help="Send pause signal to the workflow")
-    subparsers.add_parser("resume", help="Send resume signal to the workflow")
-    subparsers.add_parser("status", help="Print workflow progress snapshot")
+    pause_parser = subparsers.add_parser("pause", help="Send pause signal to the workflow")
+    resume_parser = subparsers.add_parser("resume", help="Send resume signal to the workflow")
+    status_parser = subparsers.add_parser("status", help="Print workflow progress snapshot")
+    # Targeting flags for multi-run control
+    pause_parser.add_argument(
+        "--workflow-id",
+        dest="workflow_id",
+        help="Target a specific workflow id when multiple runs exist.",
+    )
+    resume_parser.add_argument(
+        "--workflow-id",
+        dest="workflow_id",
+        help="Target a specific workflow id when multiple runs exist.",
+    )
+    status_parser.add_argument(
+        "--workflow-id",
+        dest="workflow_id",
+        help="Target a specific workflow id when multiple runs exist.",
+    )
     subparsers.add_parser("clean", help="Stop services and remove artifacts")
     mock_parser = subparsers.add_parser("mock", help="Control the mock API availability")
     mock_subparsers = mock_parser.add_subparsers(dest="mock_command", required=True)
@@ -366,11 +572,11 @@ async def main(argv: list[str]) -> None:
     if args.command == "start":
         await start_demo(args)
     elif args.command == "pause":
-        await send_signal("pause")
+        await send_signal("pause", getattr(args, "workflow_id", None))
     elif args.command == "resume":
-        await send_signal("resume")
+        await send_signal("resume", getattr(args, "workflow_id", None))
     elif args.command == "status":
-        await query_status()
+        await query_status(getattr(args, "workflow_id", None))
     elif args.command == "clean":
         clean_artifacts()
     elif args.command == "mock":

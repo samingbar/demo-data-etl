@@ -22,6 +22,8 @@ class MockApiConfig:
     base_failure_seed: str = "temporal-etl-demo"
     rate_limit_window_seconds: int = 8
     timeout_seconds: int = 6
+    # When False, the server will not inject synthetic faults (timeouts/429/503)
+    inject_failures: bool = True
 
 
 class MockApiServer:
@@ -132,6 +134,8 @@ class MockApiServer:
 
     def _calculate_failure(self, key: str) -> Optional[str]:
         """Compute if a synthetic failure should be injected for the request."""
+        if not self.config.inject_failures:
+            return None
         digest = hashlib.sha256(f"{key}:{self.config.base_failure_seed}".encode("utf-8")).hexdigest()
         bucket = int(digest[:2], 16)
         if bucket % 17 == 0:
